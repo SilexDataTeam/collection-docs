@@ -1,0 +1,294 @@
+---
+# SPDX-FileCopyrightText: Silex Data Solutions
+# SPDX-License-Identifier: Apache-2.0
+name: Build docs
+
+# Compiles every public silexdata.* collection in the org into one
+# antsibull-docs site with a shared index, and deploys it to this repo's
+# GitHub Pages site. Each collection keeps its own standalone Pages site,
+# built by the skeleton's reusable-docs.yml; this site only adds to them.
+#
+# Collections are discovered on every run, so a new silexdata.* collection is
+# picked up by the next scheduled build without any change here or in it.
+#
+# Coverage reports are never combined. Each collection's already-published
+# report is copied unchanged into that collection's own folder, and its
+# Coverage Summary page is filled in from that same report by the skeleton's
+# own script, exactly as the collection's own docs build does.
+on:
+  schedule:
+    - cron: "23 6 * * *"
+  push:
+    branches:
+      - main
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  # Let a deploy that has started finish; only superseded PR builds are
+  # cancelled.
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  discover:
+    name: Discover collections
+    runs-on: ubuntu-latest
+    outputs:
+      collections: ${{ steps.discover.outputs.collections }}
+    steps:
+      # type=public matters: the org also has internal repos whose names match
+      # silexdata.* (silexdata.com), which the default token cannot clone.
+      #
+      # The skeleton is excluded by name as well as by its template flag, so it
+      # stays out even if the flag is cleared or it gains a root galaxy.yml.
+      #
+      # A repo is a collection only if it has a root galaxy.yml, and its
+      # namespace/name come from that file, read the same way as the
+      # reusable-docs.yml detect job, never from the repo name.
+      #
+      # pages_url is the repo's standalone site, built from the Pages URL
+      # convention; the Pages API for other repos is not readable with the
+      # default token.
+      - name: Find every public silexdata.* collection
+        id: discover
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ORG: ${{ github.repository_owner }}
+          EXCLUDE: silexdata.collection_skeleton
+        run: |
+          candidates=$(gh api --paginate "orgs/${ORG}/repos?type=public&per_page=100" \
+            --jq '.[] | select(.archived | not) | select(.is_template | not)
+                  | select(.name | test("^silexdata\\."))
+                  | [.name, .default_branch, .has_pages] | @tsv')
+
+          err=$(mktemp)
+          collections='[]'
+          while IFS=$'\t' read -r repo branch has_pages; do
+            [ -n "$repo" ] || continue
+            case " ${EXCLUDE} " in
+              *" ${repo} "*) continue ;;
+            esac
+
+            if ! galaxy=$(gh api -H "Accept: application/vnd.github.raw+json" \
+                "repos/${ORG}/${repo}/contents/galaxy.yml?ref=${branch}" 2>"$err"); then
+              if grep -q 'HTTP 404' "$err"; then
+                echo "::notice title=Not a collection::${repo} has no root galaxy.yml; skipping it."
+                continue
+              fi
+              cat "$err"
+              echo "::error title=Discovery failed::Could not read ${repo}/galaxy.yml."
+              exit 1
+            fi
+
+            namespace=$(printf '%s\n' "$galaxy" | grep -m1 '^namespace:' | awk '{print $2}' | tr -d "\"'")
+            name=$(printf '%s\n' "$galaxy" | grep -m1 '^name:' | awk '{print $2}' | tr -d "\"'")
+            if ! [[ "$namespace" =~ ^[a-z0-9_]+$ && "$name" =~ ^[a-z0-9_]+$ ]]; then
+              echo "::error title=Unreadable galaxy.yml::${repo}/galaxy.yml has no valid namespace and name."
+              exit 1
+            fi
+            fqcn="${namespace}.${name}"
+            if jq -e --arg fqcn "$fqcn" 'any(.[]; .fqcn == $fqcn)' <<<"$collections" >/dev/null; then
+              echo "::error title=Duplicate collection::More than one repo declares ${fqcn}."
+              exit 1
+            fi
+
+            pages_url=""
+            if [ "$has_pages" = "true" ]; then
+              pages_url="https://${ORG,,}.github.io/${repo}/"
+            fi
+            collections=$(jq -c \
+              --arg repo "$repo" --arg branch "$branch" \
+              --arg namespace "$namespace" --arg name "$name" \
+              --arg fqcn "$fqcn" --arg pages_url "$pages_url" \
+              '. + [{$repo, $branch, $namespace, $name, $fqcn, $pages_url}]' <<<"$collections")
+          done <<<"$candidates"
+
+          collections=$(jq -c 'sort_by(.fqcn)' <<<"$collections")
+          if [ "$(jq length <<<"$collections")" -eq 0 ]; then
+            echo "::error title=No collections::Found no public silexdata.* collection in ${ORG}."
+            exit 1
+          fi
+          jq -r '.[] | "\(.fqcn)  <-  \(.repo)@\(.branch)  \(.pages_url)"' <<<"$collections"
+          echo "collections=${collections}" >> "$GITHUB_OUTPUT"
+
+  docs:
+    name: Build the unified docsite
+    needs: discover
+    runs-on: ubuntu-latest
+    env:
+      # build.sh's antsibull-docs/ansible-doc calls run in docsbuild/, so point
+      # them at the workspace, where the collections are cloned under
+      # ansible_collections/, as reusable-docs.yml does.
+      ANSIBLE_COLLECTIONS_PATH: ${{ github.workspace }}
+    steps:
+      # For docs/index.rst, the site's root page.
+      - name: Check out repository
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      # The script each collection's own docs build uses to fill in its
+      # Coverage Summary page. Bump the ref with the skeleton's major version,
+      # alongside the collections' @v1 callers.
+      - name: Check out the skeleton's coverage summary script
+        uses: actions/checkout@v7
+        with:
+          repository: SilexDataTeam/silexdata.collection_skeleton
+          ref: v1
+          path: .skeleton
+          sparse-checkout: .github/actions/coverage-summary
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+
+      - name: Install ansible-core and antsibull-docs
+        run: python -m pip install "ansible-core~=2.21.0" antsibull-docs
+
+      - name: Clone each collection
+        env:
+          COLLECTIONS: ${{ needs.discover.outputs.collections }}
+          SERVER_URL: ${{ github.server_url }}
+          ORG: ${{ github.repository_owner }}
+        run: |
+          while IFS=$'\t' read -r repo branch namespace name; do
+            git clone --quiet --depth 1 --branch "$branch" \
+              "${SERVER_URL}/${ORG}/${repo}.git" "ansible_collections/${namespace}/${name}"
+          done < <(jq -r '.[] | [.repo, .branch, .namespace, .name] | @tsv' <<<"$COLLECTIONS")
+
+      # Each report is copied whole from the collection's standalone site into
+      # $RUNNER_TEMP, outside the build tree, and put into the built site by a
+      # later step. A collection with nothing published at /coverage/ keeps the
+      # placeholder summary page it commits, which links to its standalone
+      # report.
+      - name: Copy each coverage report and fill in its summary page
+        id: coverage
+        env:
+          COLLECTIONS: ${{ needs.discover.outputs.collections }}
+          SUMMARY_SCRIPT: .skeleton/.github/actions/coverage-summary/generate_coverage_summary.py
+        run: |
+          while IFS=$'\t' read -r namespace name pages_url; do
+            if [ -z "$pages_url" ]; then
+              echo "::notice title=No coverage report::${namespace}.${name} has no Pages site; keeping its placeholder summary page."
+              continue
+            fi
+            url="${pages_url}coverage/"
+            dest="${RUNNER_TEMP}/coverage/${namespace}/${name}"
+            mkdir -p "$dest"
+
+            # --cut-dirs drops the URL's path, so the report lands directly in
+            # $dest; --no-parent keeps wget inside /coverage/.
+            path="${url#*://*/}"
+            cut=$(printf '%s' "$path" | tr -cd / | wc -c)
+            rc=0
+            wget --quiet --mirror --no-parent --no-host-directories \
+              --cut-dirs="$cut" -e robots=off --directory-prefix="$dest" "$url" || rc=$?
+
+            if [ ! -f "${dest}/index.html" ]; then
+              rm -rf "$dest"
+              # wget exits 8 when the server answered with an error, i.e. the
+              # site has no /coverage/; anything else is a failure to fetch.
+              if [ "$rc" -eq 8 ]; then
+                echo "::notice title=No coverage report::Nothing is published at ${url}; keeping ${namespace}.${name}'s placeholder summary page."
+              else
+                echo "::warning title=Coverage report not copied::wget exited ${rc} fetching ${url}; keeping ${namespace}.${name}'s placeholder summary page."
+              fi
+              continue
+            fi
+            if [ "$rc" -ne 0 ]; then
+              echo "::warning title=Incomplete coverage report::wget exited ${rc} copying ${url}; some of ${namespace}.${name}'s report pages may be missing."
+            fi
+
+            rst="ansible_collections/${namespace}/${name}/docs/docsite/rst/coverage-report.rst"
+            if [ -f "$rst" ]; then
+              python3 "$SUMMARY_SCRIPT" "${dest}/index.html" "$rst"
+            fi
+          done < <(jq -r '.[] | [.namespace, .name, .pages_url] | @tsv' <<<"$COLLECTIONS")
+
+      # No --squash-hierarchy: with several collections, leaving it out is what
+      # makes antsibull-docs emit the shared index and nest each collection
+      # under collections/<namespace>/<name>/, as on docs.ansible.com.
+      #
+      # docs/index.rst replaces the generated root page only to give it a Silex
+      # title and introduction; keep its toctrees in step with what
+      # sphinx-init generates.
+      - name: Generate the Sphinx project
+        env:
+          COLLECTIONS: ${{ needs.discover.outputs.collections }}
+        run: |
+          mapfile -t fqcns < <(jq -r '.[].fqcn' <<<"$COLLECTIONS")
+          mkdir -p docsbuild
+          antsibull-docs sphinx-init --use-current --dest-dir docsbuild \
+            --project "Silex Data Ansible collections" \
+            --copyright "Silex Data Solutions" \
+            --title "Silex Data Ansible Collections" \
+            --html-short-title "Silex Data Collections" \
+            --index-rst-source docs/index.rst \
+            "${fqcns[@]}"
+
+      - name: Build the HTML site
+        working-directory: docsbuild
+        run: |
+          python -m pip install -r requirements.txt
+          ./build.sh
+
+      # Each collection's "Coverage Report" button links to the relative
+      # coverage/ (its links.yml), so on collections/<namespace>/<name>/ it
+      # resolves to the copy put here without rewriting anything.
+      - name: Put each coverage report in its collection's folder
+        id: place
+        run: |
+          shopt -s nullglob
+          for report in "${RUNNER_TEMP}/coverage"/*/*/; do
+            report="${report%/}"
+            collection="${report#"${RUNNER_TEMP}/coverage/"}"
+            target="docsbuild/build/html/collections/${collection}/coverage"
+            if [ -e "$target" ]; then
+              echo "::error title=Coverage path taken::The built site already has ${target}."
+              exit 1
+            fi
+            mkdir -p "$(dirname "$target")"
+            cp -R "$report" "$target"
+          done
+
+      - name: Upload the site for review
+        if: github.event_name == 'pull_request'
+        uses: actions/upload-artifact@v7
+        with:
+          name: docs-html
+          path: docsbuild/build/html
+          if-no-files-found: error
+          retention-days: 7
+
+      - name: Upload the site for GitHub Pages
+        if: github.event_name != 'pull_request'
+        uses: actions/upload-pages-artifact@v5
+        with:
+          path: docsbuild/build/html
+          retention-days: 1
+
+  deploy:
+    name: Deploy to GitHub Pages
+    needs: docs
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Configure GitHub Pages
+        uses: actions/configure-pages@v6
+
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v5

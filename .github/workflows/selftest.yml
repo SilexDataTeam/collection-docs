@@ -1,0 +1,79 @@
+---
+# SPDX-FileCopyrightText: Silex Data Solutions
+# SPDX-License-Identifier: Apache-2.0
+name: Selftest
+
+# Lints the workflows and tests build-docs.yml's decision-making steps against
+# fixtures. The full site build itself runs on every PR in build-docs.yml.
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  actionlint:
+    name: Lint the workflows
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7
+
+      # Pinned image rather than the upstream install script, to avoid piping
+      # a downloaded shell script into bash. The image bundles shellcheck, so
+      # every run: block is shellchecked too.
+      - name: Run actionlint
+        run: |
+          docker run --rm -v "${PWD}:/repo" -w /repo rhysd/actionlint:1.7.12 \
+            -color .github/workflows/*.yml
+
+  steps:
+    name: Test the step logic
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7
+
+      - name: Set up Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: "3.14"
+
+      - name: Install test tooling
+        run: python -m pip install pytest pyyaml
+
+      # Runs each decision-making run: step of build-docs.yml against
+      # fixtures, exactly as the runner's bash would. See tests/conftest.py.
+      - name: Run the step tests
+        run: python -m pytest -v tests
+
+  # A skipped job passes a required check, so require this gate rather than
+  # the jobs above, and fail it on anything but success.
+  result:
+    name: Selftest result
+    if: always()
+    needs:
+      - actionlint
+      - steps
+    runs-on: ubuntu-latest
+    steps:
+      - name: Fail unless every selftest job passed
+        env:
+          ACTIONLINT: ${{ needs.actionlint.result }}
+          STEPS: ${{ needs.steps.result }}
+        run: |
+          echo "actionlint: ${ACTIONLINT}  steps: ${STEPS}"
+          for r in "$ACTIONLINT" "$STEPS"; do
+            if [ "$r" != "success" ]; then
+              echo "::error title=Selftest failed::actionlint=${ACTIONLINT}, steps=${STEPS}."
+              exit 1
+            fi
+          done
